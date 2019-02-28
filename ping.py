@@ -12,7 +12,8 @@ import struct
 import sys
 import time
 import socket, sys
-from random import randint
+from math import ceil
+from random import choice
 
 from impacket import ImpactPacket
 import ipaddr
@@ -74,7 +75,8 @@ class Response(object):
 
 
 class Ping(object):
-    def __init__(self, source, destination, timeout=1000, packet_size=55, own_id=None, quiet_output=False, udp=False,
+    def __init__(self, me, source, destination, timeout=1000, packet_size=200, own_id=None, quiet_output=False,
+                 udp=False,
                  bind=None):
         self.quiet_output = quiet_output
         if quiet_output:
@@ -83,12 +85,17 @@ class Ping(object):
             self.response.timeout = timeout
             self.response.packet_size = packet_size
 
+        self.me = me
         self.destination = destination
         self.source = source
         self.timeout = timeout
         self.packet_size = packet_size
         self.udp = udp
         self.bind = bind
+        self.packet_number = {}
+        self.return_home_file_name = None
+        self.return_home_ip = None
+        self.received_files = {}
 
         try:
             self.current_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
@@ -154,33 +161,6 @@ class Ping(object):
         raise Exception, "unknown_host"
 
     # sys.exit(-1)
-
-    def print_success(self, delay, ip, packet_size, ip_header, icmp_header, header=False):
-        if ip == self.destination:
-            from_info = ip
-        else:
-            from_info = "%s (%s)" % (self.destination, ip)
-
-        msg = "%d bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms" % (
-            packet_size, from_info, icmp_header["seq_number"], ip_header["ttl"], delay)
-
-        if self.quiet_output:
-            self.response.output.append(msg)
-            self.response.ret_code = 0
-        else:
-            print(msg)
-        if header:
-            print("IP header: %r" % ip_header)
-            print("ICMP header: %r" % icmp_header)
-
-    def print_failed(self):
-        msg = "Request timed out."
-
-        if self.quiet_output:
-            self.response.output.append(msg)
-            self.response.ret_code = 1
-        else:
-            print(msg)
 
     def print_exit(self):
         msg = "\n----%s PYTHON PING Statistics----" % (self.destination)
@@ -251,59 +231,8 @@ class Ping(object):
 
     # --------------------------------------------------------------------------
 
-    def run(self, count=None, deadline=None):
-        """
-        send and receive pings in a loop. Stop if count or until deadline.
-        """
-        if not self.quiet_output:
-            self.setup_signal_handler()
-
-        while True:
-            delay = self.do()
-
-            self.seq_number += 1
-            if count and self.seq_number >= count:
-                break
-            if deadline and self.total_time >= deadline:
-                break
-
-            if delay == None:
-                delay = 0
-
-            # Pause for the remainder of the MAX_SLEEP period (if applicable)
-            if (MAX_SLEEP > delay):
-                time.sleep((MAX_SLEEP - delay) / 1000.0)
-
-        self.print_exit()
-        if self.quiet_output:
-            return self.response
-
-    def do(self):
-
-        # Send one ICMP ECHO_REQUEST and receive the response until self.timeout
-        send_time = self.send_one_ping()
-        if send_time == None:
-            return
-        self.send_count += 1
-
-    # receive_time, packet_size, ip, ip_header, icmp_header = self.receive_one_ping(current_socket)
-
-    # if receive_time:
-    # 	self.receive_count += 1
-    # 	delay = (receive_time - send_time) * 1000.0
-    # 	self.total_time += delay
-    # 	if self.min_time > delay:
-    # 		self.min_time = delay
-    # 	if self.max_time < delay:
-    # 		self.max_time = delay
-    #
-    # 	self.print_success(delay, ip, packet_size, ip_header, icmp_header)
-    # 	return delay
-    # else:
-    # 	self.print_failed()
-
     # send an ICMP ECHO_REQUEST packet
-    def send_one_ping(self, src, dst):
+    def send_one_ping(self, src, dst, data, id):
 
         # Create a new IP packet and set its source and destination IP addresses
         ip = ImpactPacket.IP()
@@ -316,11 +245,11 @@ class Ping(object):
 
         # inlude a small payload inside the ICMP packet
         # and have the ip packet contain the ICMP packet
-        icmp.contains(ImpactPacket.Data("testData"))
+        icmp.contains(ImpactPacket.Data(data))
         ip.contains(icmp)
 
         # give the ICMP packet some ID
-        icmp.set_icmp_id(0x03)
+        icmp.set_icmp_id(id)
 
         # set the ICMP packet checksum
         icmp.set_icmp_cksum(0)
@@ -342,23 +271,75 @@ class Ping(object):
     # timeout = in ms
     def receiver(self):
         while True:
+            # print("return_home_file_name: %s" % self.return_home_file_name)
+            if self.return_home_file_name is not None and self.return_home_ip is None and len(self.received_files) == self.packet_number[self.return_home_file_name]:
+                f = open(self.return_home_file_name, "w+")
+                for key, value in sorted(self.received_files.iteritems()):
+                    f.write(value)
+                f.close()
+                print("%s saved successfully!" % self.return_home_file_name)
+                self.received_files = {}
+                self.return_home_file_name = None
             inputready, outputready, exceptready = select.select([self.current_socket, sys.stdin], [], [])
             for sock in inputready:
                 # incoming message from remote server
                 if sock == self.current_socket:
+                    # print("ping socket")
                     self.receive_one_ping()
 
-                    # user entered a message
+                # user entered a message
                 else:
                     msg = sys.stdin.readline()
+                    msg = msg.lower()
+                    splittedMsg = msg.split(" ")
+                    cmd = splittedMsg[0]
+                    if cmd == "return_home":
+                        host_list = (range(1, HOST_NUMBER + 1))
+                        host_list.remove(self.me)
+                        source_num = choice(host_list)
+                        source = "10.0.0." + str(source_num)
+                        host_list.remove(source_num)
+                        dest_num = choice(host_list)
+                        dest = "10.0.0." + str(dest_num)
+                        # print("source: %s" % source)
+                        # print("dest: %s" % dest)
+                        self.return_home_file_name = splittedMsg[1].replace("\n", "")
+                        self.send_one_ping(source, dest,
+                                           "return_home;" + self.return_home_file_name + ";" + self.source, 0x03)
+                    elif cmd == "send":
+                        dest = splittedMsg[2].replace("\n", "")
+                        dest_num = int(dest.split(".")[-1])
+                        host_list = (range(1, HOST_NUMBER + 1))
+                        host_list.remove(dest_num)
+                        host_list.remove(self.me)
 
-                    if msg.lower() == "return home":
-                        self.send_one_ping("", "")  # TODO:
-                    else:
-                        splittedMsg = msg.split(" ")
-                        source = "10.0.0." + str(randint(1, HOST_NUMBER))
-                        print(source)
-                        self.send_one_ping(source, splittedMsg[2])
+                        fileName = splittedMsg[1]
+                        fileSize = os.stat(fileName).st_size
+                        chunkSize = self.packet_size - len(fileName) - 1
+                        num_of_packets = ceil(float(fileSize) / chunkSize)
+                        self.packet_number[fileName] = num_of_packets
+                        print(self.packet_number)
+                        # print(num_of_packets)
+
+                        file = open(fileName)
+                        id = 1
+                        chunk = file.read(chunkSize)
+                        while chunk != "":
+                            chunk = fileName + ";" + chunk
+                            source = "10.0.0." + str(choice(host_list))
+                            self.send_one_ping(source, dest, chunk, id)
+                            id += 1
+                            chunk = file.read(chunkSize)
+                            # print("source: %s" % source)
+                            # print("dest: %s" % dest)
+                        # print("---- file sent")
+                        file.close()
+                        try:
+                            os.remove(fileName)
+                        except OSError:
+                            pass
+                    elif cmd == "test":
+                        print("recieved files: %s" % self.received_files)
 
     def receive_one_ping(self):
 
@@ -372,6 +353,7 @@ class Ping(object):
             struct_format="!BBHHH",
             data=packet_data[20:28]
         )
+        # print("type %s" % icmp_header["type"])
 
         receive_time = default_timer()
 
@@ -384,15 +366,50 @@ class Ping(object):
             struct_format="!BBHHHBBHII",
             data=packet_data[:20]
         )
+
+        data = packet_data[28:]
+        # print("data: %s" % data)
+        splitted_data = data.split(";")
+
+        # print(splitted_data)
+
+        # print("----")
+        # print(self.return_home_file_name)
+        # print(splitted_data[0])
+        # print("--- %s - %s" % (self.return_home_file_name is not None, self.return_home_file_name == splitted_data[0]))
+        if self.return_home_file_name is not None and self.return_home_file_name == splitted_data[0]:
+            # print("here")
+            if self.return_home_ip is None:
+                self.received_files[icmp_header["packet_id"]] = splitted_data[1]
+            else:
+                self.send_one_ping(self.source, self.return_home_ip, data, icmp_header["packet_id"])
+                self.return_home_file_name = None
+                self.return_home_ip = None
+
+        elif int(icmp_header["type"]) == ICMP_ECHOREPLY:
+            # print("reply")
+            host_list = (range(1, HOST_NUMBER + 1))
+            host_list.remove(self.me)
+            source_num = choice(host_list)
+            source = "10.0.0." + str(source_num)
+            host_list.remove(source_num)
+            dest_num = choice(host_list)
+            dest = "10.0.0." + str(dest_num)
+            # print("source: %s" % source)
+            # print("dest: %s" % dest)
+            self.send_one_ping(source, dest, data, icmp_header["packet_id"])
+
+        if splitted_data[0] == "return_home" and self.return_home_file_name is None:
+            # print("here222")
+            self.return_home_file_name = splitted_data[1].replace("\n", "")
+            self.return_home_ip = splitted_data[2]
+
+        # if int(icmp_header["type"]) == ICMP_ECHO:
+        #     print("request")
         packet_size = len(packet_data) - 28
         ip = socket.inet_ntoa(struct.pack("!I", ip_header["src_ip"]))
         # XXX: Why not ip = address[0] ???
         return receive_time, packet_size, ip, ip_header, icmp_header
-
-
-def ping(source, hostname, timeout=1000, count=3, packet_size=55, *args, **kwargs):
-    p = Ping(source, hostname, timeout, packet_size, *args, **kwargs)
-    return p
 
 
 def get_ip_address(ifname):
@@ -404,10 +421,9 @@ def get_ip_address(ifname):
     )[20:24])
 
 
-print(get_ip_address('eth0'))  # '192.168.0.110'
-
 if __name__ == "__main__":
-    cur_hostname = raw_input("Enter your host name:")
+    cur_hostname = sys.argv[1]
     cur_ipaddress = get_ip_address(str(cur_hostname) + '-eth0')
-    p = ping(cur_ipaddress, "8.8.8.8")
+    print("my ip address: %s" % cur_ipaddress)
+    p = Ping(int(cur_hostname[1:]), cur_ipaddress, "")
     p.receiver()
